@@ -3,15 +3,19 @@ import os
 import math
 import random
 import string
+from collections import OrderedDict
 import logging
 from args import get_train_args
 from shutil import copyfile
 from datetime import datetime
 from collections import Counter
+from ujson import load as json_load
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.optim.lr_scheduler as sched
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
 import torch.nn.functional as F
 import msgpack
 from models import DRQA
@@ -22,159 +26,103 @@ from util import str2bool, AverageMeter
 def main():
     args, log = get_train_args()
     log.info('[Program starts. Loading data...]')
-    train, dev, dev_y, embedding, opt = load_data(vars(args))
+    train, dev, embedding, opt = load_data(vars(args))
+    tbx = SummaryWriter(args.save_dir)
     device, args.gpu_ids = util.get_available_devices()
     log.info('[Data loaded.]')
-    if args.save_dawn_logs:
-        dawn_start = datetime.now()
-        log.info('dawn_entry: epoch\tf1Score\thours')
     
-    if args.resume:
-        log.info('[loading previous model...]')
-        checkpoint = torch.load(os.path.join(args.model_dir, args.resume))
-        if args.resume_options:
-            opt = checkpoint['config']
-        state_dict = checkpoint['state_dict']
-        model = DocReaderModel(opt, embedding, state_dict)
-        epoch_0 = checkpoint['epoch'] + 1
-        # synchronize random seed
-        random.setstate(checkpoint['random_state'])
-        torch.random.set_rng_state(checkpoint['torch_state'])
-        if args.cuda:
-            torch.cuda.set_rng_state(checkpoint['torch_cuda_state'])
-        if args.reduce_lr:
-            lr_decay(model.optimizer, lr_decay=args.reduce_lr)
-            log.info('[learning rate reduced by {}]'.format(args.reduce_lr))
-
-        batches = BatchGen(dev, batch_size=args.batch_size, evaluation=True, gpu=args.cuda)
-        predictions = []
-        for i, batch in enumerate(batches):
-            text = batch[-2]
-            spans = batch[-1]
-            pred = []
-            max_len = opt['max_len'] or score_s.size(1)
-            for i in range(score_s.size(0)):
-                scores = torch.ger(score_s[i], score_e[i])
-                scores.triu_().tril_(max_len - 1)
-                scores = scores.numpy()
-                s_idx, e_idx = np.unravel_index(np.argmax(scores), scores.shape)
-                s_offset, e_offset = spans[i][s_idx][0], spans[i][e_idx][1]
-                pred.append(text[i][s_offset:e_offset])
-            predictions.extend(pred)
-            log.debug('> evaluating [{}/{}]'.format(i, len(batches)))
-        em, f1 = score(predictions, dev_y)
-
-        log.info("[dev EM: {} F1: {}]".format(em, f1))
-        if math.fabs(em - checkpoint['em']) > 1e-3 or math.fabs(f1 - checkpoint['f1']) > 1e-3:
-            log.info('Inconsistent: recorded EM: {} F1: {}'.format(checkpoint['em'], checkpoint['f1']))
-            log.error('Error loading model: current code is inconsistent with code used to train the previous model.')
-            exit(1)
-        best_val_score = checkpoint['best_eval']
+    if args.load_path:
+        log.info(f'Loading checkpoint from {args.load_path}...')
+        model, step = util.load_model(model, args.load_path, args.gpu_ids)
     else:
-        model = DocReaderModel(opt, embedding)
-        epoch_0 = 1
-        best_val_score = 0.0
+        model = DRQA(opt, embedding = embedding)
+        step = 0
         updates = 0
-        optimizer = optim.Adamax(parameters, weight_decay = opt['weight_decay'])
-        scheduler = sched.LambdaLR(optimizer, lambda s: 1.)
-        train_loss = AverageMeter()
+        
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adamax(parameters, weight_decay = opt['weight_decay'])
+    scheduler = sched.LambdaLR(optimizer, lambda s: 1.)
+    train_loss = AverageMeter()
         
     model = nn.DataParallel(model, args.gpu_ids)
     model = model.to(device)
+    model.train()
+    
+    # get saver
+    saver = util.CheckpointSaver(args.save_dir,
+                                 max_checkpoints=args.max_checkpoints,
+                                 metric_name=args.metric_name,
+                                 maximize_metric=args.maximize_metric,
+                                 log=log)
 
     # ema = util.EMA(model, args.ema_decay)
     
+    log.info('Training...')
+    steps_till_eval = args.eval_steps
+    batch_size = args.batch_size
+    epoch = step // len(train)
+    while epoch != args.epochs:
+        epoch+=1
+        log.info(f'Starting epoch {epoch}...')
+        with torch.enable_grad(), \
+                tqdm(total=len(train)) as progress_bar:
+            # train
+            batches = BatchGen(train, batch_size=batch_size, gpu=args.cuda)
+            for i, batch in enumerate(batches):
+                # Transfer to GPU
+                inputs = [e.to(device) for e in batch[:7]]
+                target_s = batch[7].to(device)
+                target_e = batch[8].to(device)
+                optimizer.zero_grad()
 
-    for epoch in range(epoch_0, epoch_0 + args.epochs):
-        log.warning('Epoch {}'.format(epoch))
-        # train
-        batches = BatchGen(train, batch_size=args.batch_size, gpu=args.cuda)
-        start = datetime.now()
-        
-        model.train()
-        for i, batch in enumerate(batches):
-            # Transfer to GPU
-            inputs = [e.to(device) for e in batch[:7]]
-            target_s = batch[7].to(device)
-            target_e = batch[8].to(device)
-            optimizer.zero_grad()
-            
-            # Forward
-            score_s,score_e = model(*inputs)
-            loss = F.nll_loss(score_s, target_s) + F.nll_loss(score_e, target_e)
-            train_loss.update(loss.item())
-            
-            # Backward
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(),opt['grad_clipping'])
-            optimizer.step()
-            updates +=1
-            
-            # Clip gradients
+                # Forward
+                score_s,score_e = model(*inputs)
+                loss = F.nll_loss(score_s, target_s) + F.nll_loss(score_e, target_e)
+                loss_val = loss.item()
 
-            if i % args.log_per_updates == 0:
-                log.info('> epoch [{0:2}] updates[{1:6}] train loss[{2:.5f}] remaining[{3}]'.format(
-                    epoch,updates, train_loss.value,
-                    str((datetime.now() - start) / (i + 1) * (len(batches) - i - 1)).split('.')[0]))
-        log.debug('\n')
-        # eval
-        batches = BatchGen(dev, batch_size=args.batch_size, evaluation=True, gpu=args.cuda)
-        predictions = []
-        for i, batch in enumerate(batches):
-            model.eval()
-            inputs = [e.to(device) for e in batch[:7]]
-            
-            # Run forward
-            with torch.no_grad():
-                score_s, score_e = model(*inputs)
+                # Backward
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(),opt['grad_clipping'])
+                optimizer.step()
+                scheduler.step(step // batch_size)
+                step += batch_size
                 
-            # Get argmax test spans
-            text = batch[-2]
-            spans = batch[-1]
-            pred = []
-            max_len = opt['max_len'] or score_s.size(1)
-            for i in range(score_s.size(0)):
-                scores = torch.ger(score_s[i], score_e[i])
-                scores.triu_().tril_(max_len - 1)
-                scores = scores.numpy()
-                s_idx, e_idx = np.unravel_index(np.argmax(scores), scores.shape)
-                s_offset, e_offset = spans[i][s_idx][0], spans[i][e_idx][1]
-                pred.append(text[i][s_offset:e_offset])
-            predictions.extend(pred)
-            log.debug('> evaluating [{}/{}]'.format(i, len(batches)))
-        em, f1 = score(predictions, dev_y)
-        log.warning("dev EM: {} F1: {}".format(em, f1))
-        if args.save_dawn_logs:
-            time_diff = datetime.now() - dawn_start
-            log.warning("dawn_entry: {}\t{}\t{}".format(epoch, f1/100.0, float(time_diff.total_seconds() / 3600.0)))
-        # save
-        if not args.save_last_only or epoch == epoch_0 + args.epochs - 1:
-            model_file = os.path.join(args.model_dir, 'checkpoint_epoch_{}.pt'.format(epoch))
-            params = {
-                'state_dict': {
-                    'network': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'updates': updates,
-                    'loss': train_loss.state_dict()
-                },
-                'config': opt,
-                'epoch': epoch,
-                'em': em,
-                'f1': f1,
-                'best_eval': best_val_score,
-                'random_state': random.getstate(),
-                'torch_state': torch.random.get_rng_state(),
-                #'torch_cuda_state': torch.cuda.get_rng_state()
-            }
-            torch.save(params, model_file)
-            logger.info('model saved to {}'.format(model_file))
-            if f1 > best_val_score:
-                best_val_score = f1
-                copyfile(
-                    model_file,
-                    os.path.join(args.model_dir, 'best_model.pt'))
-                log.info('[new best model saved.]')
+                progress_bar.update(batch_size)
+                progress_bar.set_postfix(epoch=epoch,
+                                         NLL=loss_val)
+                tbx.add_scalar('train/NLL', loss_val, step)
+#                 tbx.add_scalar('train/LR',
+#                                optimizer.param_groups[0]['lr'],
+#                                step)
+                
+                steps_till_eval -= batch_size
+                if steps_till_eval <= 0:
+                    steps_till_eval = args.eval_steps
+                    # Evaluate and save checkpoint
+                    log.info(f'Evaluating at updates {step}...')
+                    results, pred_dict = evaluate(model, dev, args, device,
+                                                  args.dev_eval_file,
+                                                  args.max_ans_len,
+                                                  args.use_squad_v2)
+                    
+                    saver.save(step,opt, model, results[args.metric_name], device)
+                        
+                    results_str = ', '.join(f'{k}: {v:05.2f}' for k, v in results.items())
+                    log.info(f'Dev {results_str}')
+                
+                    # Log to TensorBoard
+                    log.info('Visualizing in TensorBoard...')
+                    for k, v in results.items():
+                        tbx.add_scalar(f'dev/{k}', v, step)
+                    util.visualize(tbx,
+                                   pred_dict=pred_dict,
+                                   eval_path=args.dev_eval_file,
+                                   step=step,
+                                   split='dev',
+                                   num_visuals=args.num_visuals)
+            log.debug('\n')
 
+            
 
 def lr_decay(optimizer, lr_decay):
     for param_group in optimizer.param_groups:
@@ -196,17 +144,65 @@ def load_data(opt):
     with open(opt['data_file'], 'rb') as f:
         data = msgpack.load(f, encoding='utf8')
     train = data['train']
-    data['dev'].sort(key=lambda x: len(x[1]))
-    dev = [x[:-1] for x in data['dev']]
-    dev_y = [x[-1] for x in data['dev']]
-    return train, dev, dev_y, embedding, opt
+    dev = data['dev']
+    return train, dev, embedding, opt
 
+def evaluate(model, dev,args, device, eval_file, max_len, use_squad_v2):
+    model.eval()
+    pred_dict = {}
+    batch_size = args.batch_size
+    batches = BatchGen(dev, batch_size=args.batch_size, evaluation=True, gpu=args.cuda)
+    nll_meter = util.AverageMeter()
+    
+    with open(eval_file, 'r') as fh:
+        gold_dict = json_load(fh)
+    with torch.no_grad(), \
+            tqdm(total=len(dev)) as progress_bar:
+        for i, batch in enumerate(batches):
+            # Setup for forward
+            inputs = [e.to(device) for e in batch[:7]]
+            target_s = batch[7].to(device)
+            target_e = batch[8].to(device)
+            ids = batch[-1]
+            
+            # Run forward
+            with torch.no_grad():
+                score_s, score_e = model(*inputs)
+            loss = F.nll_loss(score_s, target_s) + F.nll_loss(score_e, target_e)
+            nll_meter.update(loss.item())
+            
+            # Get F1 and EM scores
+            p1, p2 = score_s, score_e
+            starts, ends = util.discretize(p1, p2, max_len, use_squad_v2)  
+            
+            # Log info
+            progress_bar.update(batch_size)
+            progress_bar.set_postfix(NLL=nll_meter.avg)
+            
+            preds, _ = util.convert_tokens(gold_dict,
+                                           ids.tolist(),
+                                           starts.tolist(),
+                                           ends.tolist(),
+                                           use_squad_v2)
+            pred_dict.update(preds)
+
+    model.train()
+
+    results = util.eval_dicts(gold_dict, pred_dict, use_squad_v2)
+    results_list = [('NLL', nll_meter.avg),
+                    ('F1', results['F1']),
+                    ('EM', results['EM'])]
+    if use_squad_v2:
+        results_list.append(('AvNA', results['AvNA']))
+    results = OrderedDict(results_list)
+
+    return results, pred_dict
 
 class BatchGen:
     pos_size = None
     ner_size = None
 
-    def __init__(self, data, batch_size, gpu, evaluation=False):
+    def __init__(self, data, batch_size, gpu, evaluation=False, is_test = False):
         """
         input:
             data - list of lists
@@ -214,6 +210,7 @@ class BatchGen:
         """
         self.batch_size = batch_size
         self.eval = evaluation
+        self.is_test = is_test
         self.gpu = gpu
 
         # sort by len
@@ -232,13 +229,8 @@ class BatchGen:
 
     def __iter__(self):
         for batch in self.data:
-            log.off(batch)
             batch_size = len(batch)
             batch = list(zip(*batch))
-            if self.eval:
-                assert len(batch) == 8
-            else:
-                assert len(batch) == 10
 
             context_len = max(len(x) for x in batch[1])
             context_id = torch.LongTensor(batch_size, context_len).fill_(0)
@@ -271,7 +263,8 @@ class BatchGen:
             question_mask = torch.eq(question_id, 0)
             text = list(batch[6])
             span = list(batch[7])
-            if not self.eval:
+            ids = torch.LongTensor(batch[0])
+            if not self.is_test:
                 y_s = torch.LongTensor(batch[8])
                 y_e = torch.LongTensor(batch[9])
             if self.gpu:
@@ -282,13 +275,12 @@ class BatchGen:
                 context_mask = context_mask.pin_memory()
                 question_id = question_id.pin_memory()
                 question_mask = question_mask.pin_memory()
-            if self.eval:
+            if self.is_test:
                 yield (context_id, context_feature, context_tag, context_ent, context_mask,
-                       question_id, question_mask, text, span)
+                       question_id, question_mask, text, span, ids)
             else:
                 yield (context_id, context_feature, context_tag, context_ent, context_mask,
-                       question_id, question_mask, y_s, y_e, text, span)
-
+                       question_id, question_mask, y_s, y_e, text, span, ids)
 
 def _normalize_answer(s):
     def remove_articles(text):
@@ -348,27 +340,27 @@ def score(pred, truth):
 
 
 def load_statedict(model, state_dict):
-        # Book-keeping.
-        self.opt = opt
-        self.device = torch.cuda.current_device() if opt['cuda'] else torch.device('cpu')
-        self.updates = state_dict['updates']
-        self.train_loss = AverageMeter()
-        if state_dict:
-            self.train_loss.load(state_dict['loss'])
+    # Book-keeping.
+    self.opt = opt
+    self.device = torch.cuda.current_device() if opt['cuda'] else torch.device('cpu')
+    self.updates = state_dict['updates']
+    self.train_loss = AverageMeter()
+    if state_dict:
+        self.train_loss.load(state_dict['loss'])
 
-        # Building network.
-        self.network = RnnDocReader(opt, embedding=embedding)
-        if state_dict:
-            new_state = set(self.network.state_dict().keys())
-            for k in list(state_dict['network'].keys()):
-                if k not in new_state:
-                    del state_dict['network'][k]
-            self.network.load_state_dict(state_dict['network'])
-        self.network.to(self.device)
+    # Building network.
+    self.network = RnnDocReader(opt, embedding=embedding)
+    if state_dict:
+        new_state = set(self.network.state_dict().keys())
+        for k in list(state_dict['network'].keys()):
+            if k not in new_state:
+                del state_dict['network'][k]
+        self.network.load_state_dict(state_dict['network'])
+    self.network.to(self.device)
 
-        # Building optimizer.
-        self.opt_state_dict = state_dict['optimizer'] if state_dict else None
-        self.build_optimizer()
+    # Building optimizer.
+    self.opt_state_dict = state_dict['optimizer'] if state_dict else None
+    self.build_optimizer()
 
 if __name__ == '__main__':
     main()

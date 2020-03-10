@@ -42,7 +42,8 @@ from train import BatchGen, load_data
 
 def main(args):
     # Set up
-    args, log = get_test_args()
+    args.save_dir = util.get_save_dir(args.save_dir, args.name, training=False)
+    log = util.get_logger(args.save_dir, args.name)
     device, gpu_ids = util.get_available_devices()
 
     # Get embeddings
@@ -50,31 +51,23 @@ def main(args):
     with open('data/meta.msgpack','rb') as f:
         meta = msgpack.load(f, encoding = 'utf8')
     embedding = torch.Tensor(meta['embedding'])
-   
-    # Load checkpoint
-    log.info(f'Loading checkpoint from ...')#{args.best_model}
-    checkpoint = torch.load('models_check/best_model.pt')
-    state_dict, opt = checkpoint['state_dict'], checkpoint['config']
+    opt = vars(args)
     opt['pretrained_words'] = True
     opt['vocab_size'] = embedding.size(0)
     opt['embedding_dim'] = embedding.size(1)
     opt['pos_size'] = len(meta['vocab_tag'])
     opt['ner_size'] = len(meta['vocab_ent'])
-    BatchGen.pos_size = opt['pos_size']
-    BatchGen.ner_size = opt['ner_size']
-    
+       
     # Get model
     log.info('Building model...')
     model = DRQA(opt, embedding = embedding)
-    
-    new_state = set(model.state_dict().keys())
-    for k in list(state_dict['network'].keys()):
-        if k not in new_state:
-            del state_dict['networ'][k]
-        model.load_state_dict(state_dict['network'])
     model = nn.DataParallel(model, gpu_ids)
+    log.info(f'Loading checkpoint from {args.load_path}...')
+    model = util.load_model(model, args.load_path, gpu_ids, return_step=False)
     model = model.to(device)
     model.eval()
+    BatchGen.pos_size = opt['pos_size']
+    BatchGen.ner_size = opt['ner_size']
 
     # Get data loader
     log.info('Building dataset...')
@@ -84,7 +77,7 @@ def main(args):
 
     # Evaluate
     log.info(f'Evaluating on test split...')
-    batches = BatchGen(test, batch_size=args.batch_size, evaluation=True, gpu=args.cuda)
+    batches = BatchGen(test, batch_size=args.batch_size, evaluation=True, is_test = True, gpu=args.cuda)
     
     nll_meter = util.AverageMeter()
     pred_dict = {}  # Predictions for TensorBoard
@@ -93,24 +86,18 @@ def main(args):
     with open(eval_file, 'r') as fh:
         gold_dict = json_load(fh)
     with torch.no_grad(), \
-            tqdm(total=len(dataset)) as progress_bar:
+            tqdm(total=len(test)) as progress_bar:
         model.eval()
         for i, batch in enumerate(batches):
             # Setup for forward
             inputs = [e.to(device) for e in batch[:7]]
-            target_s = batch[7].to(device)
-            target_e = batch[8].to(device)
+            ids = batch[-1]
 
             # Forward
             with torch.no_grad():
                 score_s, score_e = model(*inputs)
                 
-            y1, y2 = y1.to(device), y2.to(device)
-            loss = F.nll_loss(score_s, target_s) + F.nll_loss(score_e, target_e)
-            nll_meter.update(loss.item(), args.batch_size)
-
-            # Get F1 and EM scores
-            p1, p2 = score_s.exp(), score_e.exp()
+            p1, p2 = score_s, score_e
             starts, ends = util.discretize(p1, p2, args.max_ans_len, args.use_squad_v2)
 
             # Log info

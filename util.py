@@ -273,7 +273,7 @@ class CheckpointSaver:
         if self.log is not None:
             self.log.info(message)
 
-    def save(self, step, model, metric_val, device):
+    def save(self, step,opt, model, metric_val, device):
         """Save model parameters to disk.
 
         Args:
@@ -285,7 +285,9 @@ class CheckpointSaver:
         ckpt_dict = {
             'model_name': model.__class__.__name__,
             'model_state': model.cpu().state_dict(),
-            'step': step
+            'step': step,
+            'opt': opt
+            #'config': model.opt
         }
         model.to(device)
 
@@ -318,7 +320,7 @@ class CheckpointSaver:
             except OSError:
                 # Avoid crashing if checkpoint has been removed or protected
                 pass
-
+            
 
 def load_model(model, checkpoint_path, gpu_ids, return_step=True):
     """Load model parameters from disk.
@@ -335,7 +337,6 @@ def load_model(model, checkpoint_path, gpu_ids, return_step=True):
     """
     device = f"cuda:{gpu_ids[0]}" if gpu_ids else 'cpu'
     ckpt_dict = torch.load(checkpoint_path, map_location=device)
-
     # Build model, load parameters
     model.load_state_dict(ckpt_dict['model_state'])
 

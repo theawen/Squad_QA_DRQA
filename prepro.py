@@ -14,50 +14,50 @@ from multiprocessing import Pool
 
 
 def main():
-#     args, log = get_setup_args()
+    args, log = get_setup_args()
 
-#     train = flatten_json(args.trn_file, 'train')
-#     dev = flatten_json(args.dev_file, 'dev')
-#     test = flatten_json(args.tst_file,'test')
-#     log.info('json data flattened.')
+    train = flatten_json(args.trn_file, 'train')
+    dev = flatten_json(args.dev_file, 'dev')
+    test = flatten_json(args.tst_file,'test')
+    log.info('json data flattened.')
 
-#     # tokenize & annotate
-#     with Pool(args.threads, initializer=init) as p:
-#         annotate_ = partial(annotate, wv_cased=args.wv_cased)
-#         train = list(tqdm(p.imap(annotate_, train, chunksize=args.batch_size), total=len(train), desc='train'))
-#         dev = list(tqdm(p.imap(annotate_, dev, chunksize=args.batch_size), total=len(dev), desc='dev'))
-#         test = list(tqdm(p.imap(annotate_, test, chunksize=args.batch_size), total=len(test), desc='test'))
-#     train = list(map(index_answer, train))
-#     initial_len = len(train)
-#     train = list(filter(lambda x: x[-1] is not None, train))
-#     log.info('drop {} inconsistent samples.'.format(initial_len - len(train)))
-#     log.info('tokens generated')
+    # tokenize & annotate
+    with Pool(args.threads, initializer=init) as p:
+        annotate_ = partial(annotate, wv_cased=args.wv_cased)
+        train = list(tqdm(p.imap(annotate_, train, chunksize=args.batch_size), total=len(train), desc='train'))
+        dev = list(tqdm(p.imap(annotate_, dev, chunksize=args.batch_size), total=len(dev), desc='dev'))
+        test = list(tqdm(p.imap(annotate_, test, chunksize=args.batch_size), total=len(test), desc='test'))
+    train = list(map(index_answer, train))
+    initial_len = len(train)
+    train = list(filter(lambda x: x[-1] is not None, train))
+    log.info('drop {} inconsistent samples.'.format(initial_len - len(train)))
+    log.info('tokens generated')
 
-#     # load vocabulary from word vector files
-#     wv_vocab = set()
-#     with open(args.wv_file) as f:
-#         for line in f:
-#             token = normalize_text(line.rstrip().split(' ')[0])
-#             wv_vocab.add(token)
-#     log.info('glove vocab loaded.')
+    # load vocabulary from word vector files
+    wv_vocab = set()
+    with open(args.wv_file) as f:
+        for line in f:
+            token = normalize_text(line.rstrip().split(' ')[0])
+            wv_vocab.add(token)
+    log.info('glove vocab loaded.')
 
-#     # build vocabulary
-#     full = train + dev + test
-#     vocab, counter = build_vocab([row[5] for row in full], [row[1] for row in full], wv_vocab, args.sort_all)
-#     total = sum(counter.values())
-#     matched = sum(counter[t] for t in vocab)
-#     log.info('vocab coverage {1}/{0} | OOV occurrence {2}/{3} ({4:.4f}%)'.format(
-#         len(counter), len(vocab), (total - matched), total, (total - matched) / total * 100))
-#     counter_tag = collections.Counter(w for row in full for w in row[3])
-#     vocab_tag = sorted(counter_tag, key=counter_tag.get, reverse=True)
-#     counter_ent = collections.Counter(w for row in full for w in row[4])
-#     vocab_ent = sorted(counter_ent, key=counter_ent.get, reverse=True)
-#     w2id = {w: i for i, w in enumerate(vocab)}
-#     tag2id = {w: i for i, w in enumerate(vocab_tag)}
-#     ent2id = {w: i for i, w in enumerate(vocab_ent)}
-#     log.info('Vocabulary size: {}'.format(len(vocab)))
-#     log.info('Found {} POS tags.'.format(len(vocab_tag)))
-#     log.info('Found {} entity tags: {}'.format(len(vocab_ent), vocab_ent))
+    # build vocabulary
+    full = train + dev + test
+    vocab, counter = build_vocab([row[5] for row in full], [row[1] for row in full], wv_vocab, args.sort_all)
+    total = sum(counter.values())
+    matched = sum(counter[t] for t in vocab)
+    log.info('vocab coverage {1}/{0} | OOV occurrence {2}/{3} ({4:.4f}%)'.format(
+        len(counter), len(vocab), (total - matched), total, (total - matched) / total * 100))
+    counter_tag = collections.Counter(w for row in full for w in row[3])
+    vocab_tag = sorted(counter_tag, key=counter_tag.get, reverse=True)
+    counter_ent = collections.Counter(w for row in full for w in row[4])
+    vocab_ent = sorted(counter_ent, key=counter_ent.get, reverse=True)
+    w2id = {w: i for i, w in enumerate(vocab)}
+    tag2id = {w: i for i, w in enumerate(vocab_tag)}
+    ent2id = {w: i for i, w in enumerate(vocab_ent)}
+    log.info('Vocabulary size: {}'.format(len(vocab)))
+    log.info('Found {} POS tags.'.format(len(vocab_tag)))
+    log.info('Found {} entity tags: {}'.format(len(vocab_ent), vocab_ent))
 
     to_id_ = partial(to_id, w2id=w2id, tag2id=tag2id, ent2id=ent2id)
     train = list(map(to_id_, train))
@@ -65,20 +65,20 @@ def main():
     test = list(map(to_id_,test))
     log.info('converted to ids.')
 
-#     vocab_size = len(vocab)
-#     embeddings = np.zeros((vocab_size, args.wv_dim))
-#     embed_counts = np.zeros(vocab_size)
-#     embed_counts[:2] = 1  # PADDING & UNK
-#     with open(args.wv_file) as f:
-#         for line in f:
-#             elems = line.rstrip().split(' ')
-#             token = normalize_text(elems[0])
-#             if token in w2id:
-#                 word_id = w2id[token]
-#                 embed_counts[word_id] += 1
-#                 embeddings[word_id] += [float(v) for v in elems[1:]]
-#     embeddings /= embed_counts.reshape((-1, 1))
-#     log.info('got embedding matrix.')
+    vocab_size = len(vocab)
+    embeddings = np.zeros((vocab_size, args.wv_dim))
+    embed_counts = np.zeros(vocab_size)
+    embed_counts[:2] = 1  # PADDING & UNK
+    with open(args.wv_file) as f:
+        for line in f:
+            elems = line.rstrip().split(' ')
+            token = normalize_text(elems[0])
+            if token in w2id:
+                word_id = w2id[token]
+                embed_counts[word_id] += 1
+                embeddings[word_id] += [float(v) for v in elems[1:]]
+    embeddings /= embed_counts.reshape((-1, 1))
+    log.info('got embedding matrix.')
 
     meta = {
         'vocab': vocab,
@@ -141,14 +141,14 @@ def flatten_json(data_file, mode):
     return rows
 
 
-def clean_spaces(text):
-    """normalize spaces in a string."""
-    text = re.sub(r'\s', ' ', text)
-    return text
+# def clean_spaces(text):
+#     """normalize spaces in a string."""
+#     text = re.sub(r'\s', ' ', text)
+#     return text
 
 
-def normalize_text(text):
-    return unicodedata.normalize('NFD', text)
+# def normalize_text(text):
+#     return unicodedata.normalize('NFD', text)
 
 
 nlp = None
